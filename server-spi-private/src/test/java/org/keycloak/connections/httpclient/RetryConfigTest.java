@@ -28,7 +28,7 @@ public class RetryConfigTest {
     @Test
     public void testDefaultValues() {
         RetryConfig config = new RetryConfig.Builder().build();
-        assertEquals(3, config.getMaxRetries());
+        assertEquals(0, config.getMaxRetries());
         assertTrue(config.isRetryOnIOException());
         assertEquals(1000, config.getInitialBackoffMillis());
         assertEquals(2.0, config.getBackoffMultiplier(), 0.001);

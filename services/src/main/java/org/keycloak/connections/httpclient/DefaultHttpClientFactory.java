@@ -106,94 +106,105 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
 
             @Override
             public CloseableHttpClient getRetriableHttpClient(RetryConfig retryConfig) {
-                // Create a new HttpClientBuilder with retry handler
-                org.apache.http.impl.client.HttpClientBuilder builder = org.apache.http.impl.client.HttpClientBuilder.create();
-
-                // Configure standard settings from the default client
-                configureStandardSettings(builder);
-
-                // Configure connection and socket timeouts from RetryConfig
-                builder.setDefaultSocketConfig(org.apache.http.config.SocketConfig.custom()
-                    .setSoTimeout(retryConfig.getSocketTimeoutMillis())
-                    .build());
-
-                // Set connection timeout
-                org.apache.http.client.config.RequestConfig requestConfig = org.apache.http.client.config.RequestConfig.custom()
-                    .setConnectTimeout(retryConfig.getConnectionTimeoutMillis())
-                    .build();
-                builder.setDefaultRequestConfig(requestConfig);
-
-                if (retryConfig.getMaxRetries() > 0) {
-                    // Create a custom retry handler that implements exponential backoff
-                    builder.setRetryHandler(new org.apache.http.impl.client.DefaultHttpRequestRetryHandler(retryConfig.getMaxRetries(), retryConfig.isRetryOnIOException()) {
-                        @Override
-                        public boolean retryRequest(IOException exception, int executionCount, org.apache.http.protocol.HttpContext context) {
-                            boolean shouldRetry = super.retryRequest(exception, executionCount, context);
-
-                            if (shouldRetry) {
-                                // Calculate exponential backoff delay with jitter if enabled
-                                long baseDelay = (long) (retryConfig.getInitialBackoffMillis() * Math.pow(retryConfig.getBackoffMultiplier(), executionCount - 1));
-                                long delayMillis = calculateBackoffDelay(executionCount, retryConfig);
-
-                                // Log retry attempt with jitter information if enabled
-                                if (retryConfig.isUseJitter()) {
-                                    logger.debugf("Retrying HTTP request (attempt %d) with backoff delay %d ms (base: %d ms, jitter factor: %.2f): %s", executionCount, delayMillis, baseDelay, retryConfig.getJitterFactor(), exception.getMessage());
-                                } else {
-                                    logger.debugf("Retrying HTTP request (attempt %d) with backoff delay %d ms: %s", executionCount, delayMillis, exception.getMessage());
-                                }
-
-                                try {
-                                    // Sleep for the calculated delay
-                                    Thread.sleep(delayMillis);
-                                } catch (InterruptedException e) {
-                                    Thread.currentThread().interrupt();
-                                    return false; // Don't retry if interrupted
-                                }
-                            } else if (executionCount > retryConfig.getMaxRetries()) {
-                                logger.debugf("Not retrying HTTP request after %d attempts: %s", executionCount - 1, exception.getMessage());
-                            }
-                            return shouldRetry;
-                        }
-
-                        private long calculateBackoffDelay(int executionCount, RetryConfig config) {
-                            // executionCount starts at 1, so we need to subtract 1 to get the retry number
-                            int retryNumber = executionCount - 1;
-
-                            // Calculate base exponential backoff: initialBackoff * (multiplier ^ retryNumber)
-                            long baseDelay = (long) (config.getInitialBackoffMillis() * Math.pow(config.getBackoffMultiplier(), retryNumber));
-
-                            // Apply jitter if enabled
-                            if (config.isUseJitter()) {
-                                double jitterFactor = config.getJitterFactor();
-                                double randomFactor = 1.0 - jitterFactor + (Math.random() * jitterFactor * 2.0);
-                                return (long) (baseDelay * randomFactor);
-                            } else {
-                                return baseDelay;
-                            }
-                        }
-                    });
+                // If retries are disabled, just return the default client
+                if (retryConfig == null || retryConfig.getMaxRetries() <= 0) {
+                    return getHttpClient();
                 }
-                return builder.build();
-            }
 
-            private void configureStandardSettings(org.apache.http.impl.client.HttpClientBuilder builder) {
-                // Copy settings from the default client configuration
-                long socketTimeout = config.getLong("socket-timeout-millis", 5000L);
+                // Create HTTP client builder
+                HttpClientBuilder builder = newHttpClientBuilder();
+
+                // Configure basic settings
+                long socketTimeout = retryConfig.getSocketTimeoutMillis();
+                long establishConnectionTimeout = retryConfig.getConnectionTimeoutMillis();
                 int maxPooledPerRoute = config.getInt("max-pooled-per-route", 64);
                 int connectionPoolSize = config.getInt("connection-pool-size", 128);
                 long connectionTTL = config.getLong("connection-ttl-millis", -1L);
+                long maxConnectionIdleTime = config.getLong("max-connection-idle-time-millis", 900000L);
                 boolean disableCookies = config.getBoolean("disable-cookies", true);
+                boolean expectContinueEnabled = getBooleanConfigWithSysPropFallback("expect-continue-enabled", false);
+                boolean reuseConnections = getBooleanConfigWithSysPropFallback("reuse-connections", true);
 
-                builder.setDefaultSocketConfig(org.apache.http.config.SocketConfig.custom()
-                    .setSoTimeout((int) socketTimeout)
-                    .build())
-                    .setMaxConnTotal(connectionPoolSize)
-                    .setMaxConnPerRoute(maxPooledPerRoute)
-                    .setConnectionTimeToLive(connectionTTL, TimeUnit.MILLISECONDS)
-                    .setConnectionManagerShared(false);
+                // Configure builder
+                builder.socketTimeout(socketTimeout, TimeUnit.MILLISECONDS)
+                        .establishConnectionTimeout(establishConnectionTimeout, TimeUnit.MILLISECONDS)
+                        .maxPooledPerRoute(maxPooledPerRoute)
+                        .connectionPoolSize(connectionPoolSize)
+                        .connectionTTL(connectionTTL, TimeUnit.MILLISECONDS)
+                        .maxConnectionIdleTime(maxConnectionIdleTime, TimeUnit.MILLISECONDS)
+                        .disableCookies(disableCookies)
+                        .proxyMappings(DefaultHttpClientFactory.this.configureProxySettings())
+                        .expectContinueEnabled(expectContinueEnabled)
+                        .reuseConnections(reuseConnections);
 
-                if (disableCookies) {
-                    builder.disableCookieManagement();
+                // Configure security settings
+                DefaultHttpClientFactory.this.configureSecuritySettings(session, builder);
+
+                // Configure retry handler
+                if (retryConfig.getMaxRetries() > 0) {
+                    builder.getApacheHttpClientBuilder().setRetryHandler(
+                            new org.apache.http.impl.client.DefaultHttpRequestRetryHandler(
+                                    retryConfig.getMaxRetries(), retryConfig.isRetryOnIOException()) {
+                                @Override
+                                public boolean retryRequest(IOException exception, int executionCount,
+                                        org.apache.http.protocol.HttpContext context) {
+                                    boolean shouldRetry = super.retryRequest(exception, executionCount, context);
+
+                                    if (shouldRetry) {
+                                        // Calculate exponential backoff delay with jitter if enabled
+                                        long baseDelay = (long) (retryConfig.getInitialBackoffMillis() *
+                                                Math.pow(retryConfig.getBackoffMultiplier(), executionCount - 1));
+                                        long delayMillis = calculateBackoffDelay(executionCount, retryConfig);
+
+                                        // Log retry attempt
+                                        if (retryConfig.isUseJitter()) {
+                                            logger.debugf(
+                                                    "Retrying HTTP request (attempt %d) with backoff delay %d ms (base: %d ms, jitter factor: %.2f): %s",
+                                                    executionCount, delayMillis, baseDelay,
+                                                    retryConfig.getJitterFactor(), exception.getMessage());
+                                        } else {
+                                            logger.debugf(
+                                                    "Retrying HTTP request (attempt %d) with backoff delay %d ms: %s",
+                                                    executionCount, delayMillis, exception.getMessage());
+                                        }
+
+                                        try {
+                                            // Sleep for the calculated delay
+                                            Thread.sleep(delayMillis);
+                                        } catch (InterruptedException e) {
+                                            Thread.currentThread().interrupt();
+                                            return false; // Don't retry if interrupted
+                                        }
+                                    } else if (executionCount > retryConfig.getMaxRetries()) {
+                                        logger.debugf("Not retrying HTTP request after %d attempts: %s",
+                                                executionCount - 1, exception.getMessage());
+                                    }
+                                    return shouldRetry;
+                                }
+                            });
+                }
+
+                return builder.build();
+            }
+
+            /**
+             * Calculates the backoff delay with optional jitter
+             */
+            private long calculateBackoffDelay(int executionCount, RetryConfig config) {
+                // executionCount starts at 1, so we need to subtract 1 to get the retry number
+                int retryNumber = executionCount - 1;
+
+                // Calculate base exponential backoff: initialBackoff * (multiplier ^ retryNumber)
+                long baseDelay = (long) (config.getInitialBackoffMillis()
+                        * Math.pow(config.getBackoffMultiplier(), retryNumber));
+
+                // Apply jitter if enabled
+                if (config.isUseJitter()) {
+                    double jitterFactor = config.getJitterFactor();
+                    double randomFactor = 1.0 - jitterFactor + (Math.random() * jitterFactor * 2.0);
+                    return (long) (baseDelay * randomFactor);
+                } else {
+                    return baseDelay;
                 }
             }
 
@@ -298,84 +309,115 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
 
     private void lazyInit(KeycloakSession session) {
         if (httpClient == null) {
-            synchronized(this) {
+            synchronized (this) {
                 if (httpClient == null) {
-                    long socketTimeout = config.getLong("socket-timeout-millis", 5000L);
-                    long establishConnectionTimeout = config.getLong("establish-connection-timeout-millis", -1L);
-                    int maxPooledPerRoute = config.getInt("max-pooled-per-route", 64);
-                    int connectionPoolSize = config.getInt("connection-pool-size", 128);
-                    long connectionTTL = config.getLong("connection-ttl-millis", -1L);
-                    long maxConnectionIdleTime = config.getLong("max-connection-idle-time-millis", 900000L);
-                    boolean disableCookies = config.getBoolean("disable-cookies", true);
-                    String clientKeystore = config.get("client-keystore");
-                    String clientKeystorePassword = config.get("client-keystore-password");
-                    String clientPrivateKeyPassword = config.get("client-key-password");
-                    boolean disableTrustManager = config.getBoolean("disable-trust-manager", false);
-
-                    boolean expectContinueEnabled = getBooleanConfigWithSysPropFallback("expect-continue-enabled", false);
-                    boolean reuseConnections = getBooleanConfigWithSysPropFallback("reuse-connections", true);
-
-                    // optionally configure proxy mappings
-                    // direct SPI config (e.g. via standalone.xml) takes precedence over env vars
-                    // lower case env vars take precedence over upper case env vars
-                    ProxyMappings proxyMappings = ProxyMappings.valueOf(config.getArray("proxy-mappings"));
-                    if (proxyMappings == null || proxyMappings.isEmpty()) {
-                        logger.debug("Trying to use proxy mapping from env vars");
-                        String httpProxy = getEnvVarValue(HTTPS_PROXY);
-                        if (isBlank(httpProxy)) {
-                            httpProxy = getEnvVarValue(HTTP_PROXY);
-                        }
-                        String noProxy = getEnvVarValue(NO_PROXY);
-
-                        logger.debugf("httpProxy: %s, noProxy: %s", httpProxy, noProxy);
-                        proxyMappings = ProxyMappings.withFixedProxyMapping(httpProxy, noProxy);
-                    }
-
-                    HttpClientBuilder builder = newHttpClientBuilder();
-
-                    builder.socketTimeout(socketTimeout, TimeUnit.MILLISECONDS)
-                            .establishConnectionTimeout(establishConnectionTimeout, TimeUnit.MILLISECONDS)
-                            .maxPooledPerRoute(maxPooledPerRoute)
-                            .connectionPoolSize(connectionPoolSize)
-                            .connectionTTL(connectionTTL, TimeUnit.MILLISECONDS)
-                            .maxConnectionIdleTime(maxConnectionIdleTime, TimeUnit.MILLISECONDS)
-                            .disableCookies(disableCookies)
-                            .proxyMappings(proxyMappings)
-                            .expectContinueEnabled(expectContinueEnabled)
-                            .reuseConnections(reuseConnections);
-
-                    TruststoreProvider truststoreProvider = session.getProvider(TruststoreProvider.class);
-                    boolean disableTruststoreProvider = truststoreProvider == null || truststoreProvider.getTruststore() == null;
-
-                    if (disableTruststoreProvider) {
-                    	logger.warn("TruststoreProvider is disabled");
-                    } else {
-                        builder.hostnameVerification(truststoreProvider.getPolicy());
-                        try {
-                            builder.trustStore(truststoreProvider.getTruststore());
-                        } catch (Exception e) {
-                            throw new RuntimeException("Failed to load truststore", e);
-                        }
-                    }
-
-                    if (disableTrustManager) {
-                    	logger.warn("TrustManager is disabled");
-                    	builder.disableTrustManager();
-                    }
-
-                    if (clientKeystore != null) {
-                        clientKeystore = EnvUtil.replace(clientKeystore);
-                        try {
-                            KeyStore clientCertKeystore = KeystoreUtil.loadKeyStore(clientKeystore, clientKeystorePassword);
-                            builder.keyStore(clientCertKeystore, clientPrivateKeyPassword);
-                        } catch (Exception e) {
-                            throw new RuntimeException("Failed to load keystore", e);
-                        }
-                    }
-                    httpClient = builder.build();
+                    // Create the default HTTP client with no retries
+                    httpClient = createHttpClientWithoutRetries(session);
                 }
             }
         }
+    }
+
+    /**
+     * Creates an HTTP client without retry functionality
+     */
+    private CloseableHttpClient createHttpClientWithoutRetries(KeycloakSession session) {
+        // Create HTTP client builder
+        HttpClientBuilder builder = newHttpClientBuilder();
+
+        // Configure basic settings
+        long socketTimeout = config.getLong("socket-timeout-millis", 5000L);
+        long establishConnectionTimeout = config.getLong("establish-connection-timeout-millis", -1L);
+        int maxPooledPerRoute = config.getInt("max-pooled-per-route", 64);
+        int connectionPoolSize = config.getInt("connection-pool-size", 128);
+        long connectionTTL = config.getLong("connection-ttl-millis", -1L);
+        long maxConnectionIdleTime = config.getLong("max-connection-idle-time-millis", 900000L);
+        boolean disableCookies = config.getBoolean("disable-cookies", true);
+        boolean expectContinueEnabled = getBooleanConfigWithSysPropFallback("expect-continue-enabled", false);
+        boolean reuseConnections = getBooleanConfigWithSysPropFallback("reuse-connections", true);
+
+        // Configure builder
+        builder.socketTimeout(socketTimeout, TimeUnit.MILLISECONDS)
+                .establishConnectionTimeout(establishConnectionTimeout, TimeUnit.MILLISECONDS)
+                .maxPooledPerRoute(maxPooledPerRoute)
+                .connectionPoolSize(connectionPoolSize)
+                .connectionTTL(connectionTTL, TimeUnit.MILLISECONDS)
+                .maxConnectionIdleTime(maxConnectionIdleTime, TimeUnit.MILLISECONDS)
+                .disableCookies(disableCookies)
+                .proxyMappings(configureProxySettings())
+                .expectContinueEnabled(expectContinueEnabled)
+                .reuseConnections(reuseConnections);
+
+        // Configure security settings
+        configureSecuritySettings(session, builder);
+
+        // Build the client
+        return builder.build();
+    }
+
+    /**
+     * Configures security settings for an HTTP client builder.
+     *
+     * @param session The Keycloak session
+     * @param builder The HTTP client builder to configure
+     */
+    private void configureSecuritySettings(KeycloakSession session, HttpClientBuilder builder) {
+        // Configure TrustStore
+        TruststoreProvider truststoreProvider = session.getProvider(TruststoreProvider.class);
+        boolean disableTruststoreProvider = truststoreProvider == null || truststoreProvider.getTruststore() == null;
+
+        if (disableTruststoreProvider) {
+            logger.warn("TruststoreProvider is disabled");
+        } else {
+            builder.hostnameVerification(truststoreProvider.getPolicy());
+            try {
+                builder.trustStore(truststoreProvider.getTruststore());
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to load truststore", e);
+            }
+        }
+
+        // Configure TrustManager
+        boolean disableTrustManager = config.getBoolean("disable-trust-manager", false);
+        if (disableTrustManager) {
+            logger.warn("TrustManager is disabled");
+            builder.disableTrustManager();
+        }
+
+        // Configure KeyStore
+        String clientKeystore = config.get("client-keystore");
+        if (clientKeystore != null) {
+            clientKeystore = EnvUtil.replace(clientKeystore);
+            String clientKeystorePassword = config.get("client-keystore-password");
+            String clientPrivateKeyPassword = config.get("client-key-password");
+            try {
+                KeyStore clientCertKeystore = KeystoreUtil.loadKeyStore(clientKeystore, clientKeystorePassword);
+                builder.keyStore(clientCertKeystore, clientPrivateKeyPassword);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to load keystore", e);
+            }
+        }
+    }
+
+    /**
+     * Configures proxy settings for HTTP clients.
+     *
+     * @return ProxyMappings configured based on settings or environment variables
+     */
+    private ProxyMappings configureProxySettings() {
+        ProxyMappings proxyMappings = ProxyMappings.valueOf(config.getArray("proxy-mappings"));
+        if (proxyMappings == null || proxyMappings.isEmpty()) {
+            logger.debug("Trying to use proxy mapping from env vars");
+            String httpProxy = getEnvVarValue(HTTPS_PROXY);
+            if (isBlank(httpProxy)) {
+                httpProxy = getEnvVarValue(HTTP_PROXY);
+            }
+            String noProxy = getEnvVarValue(NO_PROXY);
+
+            logger.debugf("httpProxy: %s, noProxy: %s", httpProxy, noProxy);
+            proxyMappings = ProxyMappings.withFixedProxyMapping(httpProxy, noProxy);
+        }
+        return proxyMappings;
     }
 
     protected HttpClientBuilder newHttpClientBuilder() {
