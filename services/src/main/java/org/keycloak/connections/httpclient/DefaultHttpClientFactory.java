@@ -75,6 +75,9 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
     private final InputStreamResponseHandler inputStreamResponseHandler = new InputStreamResponseHandler();
     private long maxConsumedResponseSize;
 
+    // Retry configuration
+    private RetryConfig defaultRetryConfig;
+
     private static class InputStreamResponseHandler extends AbstractResponseHandler<InputStream> {
 
         public InputStream handleEntity(HttpEntity entity) throws IOException {
@@ -94,6 +97,104 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
             @Override
             public CloseableHttpClient getHttpClient() {
                 return httpClient;
+            }
+
+            @Override
+            public CloseableHttpClient getRetriableHttpClient() {
+                return getRetriableHttpClient(defaultRetryConfig);
+            }
+
+            @Override
+            public CloseableHttpClient getRetriableHttpClient(RetryConfig retryConfig) {
+                // Create a new HttpClientBuilder with retry handler
+                org.apache.http.impl.client.HttpClientBuilder builder = org.apache.http.impl.client.HttpClientBuilder.create();
+
+                // Configure standard settings from the default client
+                configureStandardSettings(builder);
+
+                // Configure connection and socket timeouts from RetryConfig
+                builder.setDefaultSocketConfig(org.apache.http.config.SocketConfig.custom()
+                    .setSoTimeout(retryConfig.getSocketTimeoutMillis())
+                    .build());
+
+                // Set connection timeout
+                org.apache.http.client.config.RequestConfig requestConfig = org.apache.http.client.config.RequestConfig.custom()
+                    .setConnectTimeout(retryConfig.getConnectionTimeoutMillis())
+                    .build();
+                builder.setDefaultRequestConfig(requestConfig);
+
+                if (retryConfig.getMaxRetries() > 0) {
+                    // Create a custom retry handler that implements exponential backoff
+                    builder.setRetryHandler(new org.apache.http.impl.client.DefaultHttpRequestRetryHandler(retryConfig.getMaxRetries(), retryConfig.isRetryOnIOException()) {
+                        @Override
+                        public boolean retryRequest(IOException exception, int executionCount, org.apache.http.protocol.HttpContext context) {
+                            boolean shouldRetry = super.retryRequest(exception, executionCount, context);
+
+                            if (shouldRetry) {
+                                // Calculate exponential backoff delay with jitter if enabled
+                                long baseDelay = (long) (retryConfig.getInitialBackoffMillis() * Math.pow(retryConfig.getBackoffMultiplier(), executionCount - 1));
+                                long delayMillis = calculateBackoffDelay(executionCount, retryConfig);
+
+                                // Log retry attempt with jitter information if enabled
+                                if (retryConfig.isUseJitter()) {
+                                    logger.debugf("Retrying HTTP request (attempt %d) with backoff delay %d ms (base: %d ms, jitter factor: %.2f): %s", executionCount, delayMillis, baseDelay, retryConfig.getJitterFactor(), exception.getMessage());
+                                } else {
+                                    logger.debugf("Retrying HTTP request (attempt %d) with backoff delay %d ms: %s", executionCount, delayMillis, exception.getMessage());
+                                }
+
+                                try {
+                                    // Sleep for the calculated delay
+                                    Thread.sleep(delayMillis);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    return false; // Don't retry if interrupted
+                                }
+                            } else if (executionCount > retryConfig.getMaxRetries()) {
+                                logger.debugf("Not retrying HTTP request after %d attempts: %s", executionCount - 1, exception.getMessage());
+                            }
+                            return shouldRetry;
+                        }
+
+                        private long calculateBackoffDelay(int executionCount, RetryConfig config) {
+                            // executionCount starts at 1, so we need to subtract 1 to get the retry number
+                            int retryNumber = executionCount - 1;
+
+                            // Calculate base exponential backoff: initialBackoff * (multiplier ^ retryNumber)
+                            long baseDelay = (long) (config.getInitialBackoffMillis() * Math.pow(config.getBackoffMultiplier(), retryNumber));
+
+                            // Apply jitter if enabled
+                            if (config.isUseJitter()) {
+                                double jitterFactor = config.getJitterFactor();
+                                double randomFactor = 1.0 - jitterFactor + (Math.random() * jitterFactor * 2.0);
+                                return (long) (baseDelay * randomFactor);
+                            } else {
+                                return baseDelay;
+                            }
+                        }
+                    });
+                }
+                return builder.build();
+            }
+
+            private void configureStandardSettings(org.apache.http.impl.client.HttpClientBuilder builder) {
+                // Copy settings from the default client configuration
+                long socketTimeout = config.getLong("socket-timeout-millis", 5000L);
+                int maxPooledPerRoute = config.getInt("max-pooled-per-route", 64);
+                int connectionPoolSize = config.getInt("connection-pool-size", 128);
+                long connectionTTL = config.getLong("connection-ttl-millis", -1L);
+                boolean disableCookies = config.getBoolean("disable-cookies", true);
+
+                builder.setDefaultSocketConfig(org.apache.http.config.SocketConfig.custom()
+                    .setSoTimeout((int) socketTimeout)
+                    .build())
+                    .setMaxConnTotal(connectionPoolSize)
+                    .setMaxConnPerRoute(maxPooledPerRoute)
+                    .setConnectionTimeToLive(connectionTTL, TimeUnit.MILLISECONDS)
+                    .setConnectionManagerShared(false);
+
+                if (disableCookies) {
+                    builder.disableCookieManagement();
+                }
             }
 
             @Override
@@ -165,6 +266,34 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
     @Override
     public void init(Config.Scope config) {
         this.config = config;
+
+        // Initialize default retry configuration
+        int maxRetries = config.getInt("http-client.default-max-retries", 0); // No retries by default
+        boolean retryOnIOException = config.getBoolean("http-client.default-retry-on-io-exception", true);
+        long initialBackoffMillis = config.getLong("http-client.default-initial-backoff-millis", 1000L);
+
+        // Get backoff multiplier as a string and convert to double (Config.Scope doesn't have getDouble)
+        String backoffMultiplierStr = config.get("http-client.default-backoff-multiplier", "2.0");
+        double backoffMultiplier = Double.parseDouble(backoffMultiplierStr);
+
+        // Get jitter settings
+        boolean useJitter = config.getBoolean("http-client.default-use-jitter", true);
+        String jitterFactorStr = config.get("http-client.default-jitter-factor", "0.5");
+        double jitterFactor = Double.parseDouble(jitterFactorStr);
+
+        int connectionTimeoutMillis = config.getInt("http-client.default-connection-timeout-millis", 10000);
+        int socketTimeoutMillis = config.getInt("http-client.default-socket-timeout-millis", 10000);
+
+        defaultRetryConfig = new RetryConfig.Builder()
+            .maxRetries(maxRetries)
+            .retryOnIOException(retryOnIOException)
+            .initialBackoffMillis(initialBackoffMillis)
+            .backoffMultiplier(backoffMultiplier)
+            .useJitter(useJitter)
+            .jitterFactor(jitterFactor)
+            .connectionTimeoutMillis(connectionTimeoutMillis)
+            .socketTimeoutMillis(socketTimeoutMillis)
+            .build();
     }
 
     private void lazyInit(KeycloakSession session) {
@@ -341,6 +470,54 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
                 .type("long")
                 .helpText("Maximum size of a response consumed by the client (to prevent denial of service)")
                 .defaultValue(HttpClientProvider.DEFAULT_MAX_CONSUMED_RESPONSE_SIZE)
+                .add()
+                .property()
+                .name("http-client.default-max-retries")
+                .type("int")
+                .helpText("Maximum number of retry attempts for HTTP requests.")
+                .defaultValue(3)
+                .add()
+                .property()
+                .name("http-client.default-retry-on-io-exception")
+                .type("boolean")
+                .helpText("Whether to retry HTTP requests on IO exceptions.")
+                .defaultValue(true)
+                .add()
+                .property()
+                .name("http-client.default-initial-backoff-millis")
+                .type("long")
+                .helpText("Initial backoff time in milliseconds before the first retry attempt.")
+                .defaultValue(1000L)
+                .add()
+                .property()
+                .name("http-client.default-backoff-multiplier")
+                .type("string")
+                .helpText("Multiplier for exponential backoff between retry attempts. For example, with an initial backoff of 1000ms and a multiplier of 2.0, the retry delays would be: 1000ms, 2000ms, 4000ms, etc.")
+                .defaultValue("2.0")
+                .add()
+                .property()
+                .name("http-client.default-use-jitter")
+                .type("boolean")
+                .helpText("Whether to apply jitter to backoff times to prevent synchronized retry storms when multiple clients are retrying at the same time.")
+                .defaultValue(true)
+                .add()
+                .property()
+                .name("http-client.default-jitter-factor")
+                .type("string")
+                .helpText("Jitter factor to apply to backoff times. A value of 0.5 means the actual backoff time will be between 50% and 150% of the calculated exponential backoff time.")
+                .defaultValue("0.5")
+                .add()
+                .property()
+                .name("http-client.default-connection-timeout-millis")
+                .type("int")
+                .helpText("Connection timeout in milliseconds for retriable HTTP clients.")
+                .defaultValue(10000)
+                .add()
+                .property()
+                .name("http-client.default-socket-timeout-millis")
+                .type("int")
+                .helpText("Socket timeout in milliseconds for retriable HTTP clients.")
+                .defaultValue(10000)
                 .add()
                 .build();
     }
