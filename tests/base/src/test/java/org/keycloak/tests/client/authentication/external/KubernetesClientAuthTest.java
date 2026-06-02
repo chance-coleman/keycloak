@@ -33,6 +33,7 @@ public class KubernetesClientAuthTest extends AbstractBaseClientAuthTest {
     static final String EXTERNAL_CLIENT_ID = "system:serviceaccount:mynamespace:myserviceaccount";
     static final String IDP_ALIAS = "kubernetes-idp";
     static final String ISSUER = "http://127.0.0.1:8500/idp";
+    static final String DISCOVERY_ISSUER = "http://127.0.0.1:8500/kubernetes";
 
     @InjectRealm(config = ExernalClientAuthRealmConfig.class)
     protected ManagedRealm realm;
@@ -128,11 +129,12 @@ public class KubernetesClientAuthTest extends AbstractBaseClientAuthTest {
 
         @Override
         public RealmBuilder configure(RealmBuilder realm) {
+            // The OAuth identity provider mock must already expose the discovery endpoint when this realm is created.
             realm.identityProviders(
                     IdentityProviderBuilder.create()
                             .providerId(KubernetesIdentityProviderFactory.PROVIDER_ID)
                             .alias(IDP_ALIAS)
-                            .attribute(IdentityProviderModel.ISSUER, ISSUER)
+                            .attribute(IdentityProviderModel.ISSUER, DISCOVERY_ISSUER)
                             .build());
 
             realm.clients(ClientBuilder.create(INTERNAL_CLIENT_ID)
@@ -149,7 +151,7 @@ public class KubernetesClientAuthTest extends AbstractBaseClientAuthTest {
 
         @Override
         public OAuthIdentityProviderConfigBuilder configure(OAuthIdentityProviderConfigBuilder config) {
-            return config.kubernetes();
+            return config.kubernetes().issuer(ISSUER).discoveryPath("/kubernetes");
         }
     }
 
